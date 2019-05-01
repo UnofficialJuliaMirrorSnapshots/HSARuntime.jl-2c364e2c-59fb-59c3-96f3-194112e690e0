@@ -25,7 +25,7 @@ using Libdl
 ### Exports ###
 
 export HSAAgent, HSAQueue, HSAExecutable, HSAKernelInstance, HSAArray, HSASignal
-export get_agents, name, profile, get_first_isa, launch!
+export get_agents, profile, get_first_isa, launch!
 export get_default_agent, get_default_queue
 
 ### HSA Runtime Wrapper ###
@@ -281,15 +281,6 @@ function HSAArray(agent::HSAAgent, arr::Array{T,N}) where {T,N}
         harr[idx] = arr[idx]
     end
     return harr
-    #=
-    ref_arr = Ref(arr)
-    GC.@preserve ref_arr begin
-        ccall(:memcpy, Cvoid,
-            (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t),
-            harr.handle, ref_arr, sizeof(arr))
-    end
-    return harr
-    =#
 end
 HSAArray(arr::Array{T,N}) where {T,N} =
     HSAArray(DEFAULT_AGENT[], arr)
@@ -305,6 +296,13 @@ function Array(harr::HSAArray{T,N}) where {T,N}
     return harr
 end
 
+Base.pointer(arr::HSAArray) = arr.handle
+Base.IndexStyle(::Type{<:HSAArray}) = Base.IndexLinear()
+Base.IndexStyle(::HSAArray) = Base.IndexLinear()
+function Base.iterate(A::HSAArray, i=1) # copy-pasta from Base
+    Base.@_inline_meta
+    (i % UInt) - 1 < length(A) ? (@inbounds A[i], i + 1) : nothing
+end
 Base.similar(arr::HSAArray{T,N}) where {T,N} =
     HSAArray(T, size(arr))
 Base.similar(agent, arr::HSAArray{T,N}) where {T,N} =
@@ -319,16 +317,18 @@ function Base.fill!(arr::HSAArray{T,N}, value::T) where {T,N}
     end
 end
 @inline function Base.getindex(arr::HSAArray{T,N}, idx) where {T,N}
-    unsafe_load(arr.handle, idx)::T
+    @boundscheck checkbounds(arr, idx)
+    Base.unsafe_load(pointer(arr), idx)::T
 end
-@inline function Base.setindex!(arr::HSAArray{T,N}, value::T, idx) where {T,N}
-    unsafe_store!(arr.handle, value, idx);
+@inline function Base.setindex!(arr::HSAArray{T,N}, value, idx) where {T,N}
+    @boundscheck checkbounds(arr, idx)
+    Base.unsafe_store!(pointer(arr), value, idx)
 end
 
 ### Methods ###
 
 function Base.show(io::IO, agent::HSAAgent)
-    print(io, "HSAAgent($(agent.agent)): Name=$(name(agent)), Type=$(device_type(agent))")
+    print(io, "HSAAgent($(agent.agent)): Name=$(get_name(agent)), Type=$(device_type(agent))")
 end
 
 function get_agents()
@@ -358,7 +358,7 @@ end
 get_default_queue() =
     get_default_queue(get_default_agent())
 
-function name(agent::HSAAgent)
+function get_name(agent::HSAAgent)
     # TODO: Get name length first!
     name = repeat(" ", 64)
     @check hsa_agent_get_info(agent.agent, HSA_AGENT_INFO_NAME, name)
@@ -481,6 +481,8 @@ function Base.wait(signal::HSASignal)
                                       HSA_SIGNAL_CONDITION_LT, 1, typemax(UInt64),
                                       HSA_WAIT_STATE_BLOCKED)
 end
+
+include("memory.jl")
 
 function __init__()
     configured || return
